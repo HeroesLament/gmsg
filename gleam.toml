@@ -1,0 +1,12 @@
+name = "gmsg"
+version = "1.0.0"
+
+description = "MessagePack encoding/decoding for Gleam."
+licences = ["Apache-2.0"]
+repository = { type = "github", user = "HeroesLament", repo = "gmsg" }
+
+[dependencies]
+gleam_stdlib = ">= 0.61.0 and < 2.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
