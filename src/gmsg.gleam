@@ -18,16 +18,11 @@ import gleam/string
 /// - `Float`: Represents a 64-bit floating-point value.
 /// - `String`: Represents a UTF-8 encoded text string.
 /// - `Binary`: Represents raw binary data using a flat `BitArray`.
-/// - `BinaryTree`: Represents binary data using a structured `BytesTree`,
 ///    which is more efficient for streaming and incremental construction.
 /// - `Array`: Represents a list of MsgPack values.
 /// - `Map`: Represents key-value pairs of MsgPack values.
-/// - `Extended`: Represents an extension type with a type tag and payload.
 ///
 /// ## Notes
-/// - `BinaryTree` is preferred when constructing messages incrementally.
-/// - `Extended` corresponds to MsgPack’s "ext" type, which is
-///    used to encode application-defined data formats.
 /// - Keys in `Map` can be any MsgPack value, not just strings.
 pub type MsgPack {
   /// Represents a null or absent value.
@@ -90,31 +85,24 @@ fn decode_utf8_string(
   }
 }
 
-// Parses "<<1, 2, 3>>" → [1, 2, 3]
-fn parse_inspected_bytes(text: String) -> List(Int) {
-  let trimmed = string.trim(text)
-
-  let dropped_start = case string.starts_with(trimmed, "<<") {
-    True -> string.drop_start(from: trimmed, up_to: 2)
-    False -> trimmed
-  }
-
-  let dropped_end = case string.ends_with(dropped_start, ">>") {
-    True -> string.drop_end(from: dropped_start, up_to: 2)
-    False -> dropped_start
-  }
-
-  string.split(dropped_end, on: ",")
-  |> list.map(string.trim)
-  |> list.filter_map(int.parse)
-}
-
-fn bit_array_to_int_unsigned(bits: BitArray) -> Int {
-  bits
-  |> bit_array.inspect
-  |> parse_inspected_bytes
-  |> list.fold(0, fn(acc, byte) { int.add(int.multiply(acc, 256), byte) })
-}
+// // Parses "<<1, 2, 3>>" -> [1, 2, 3]
+// fn parse_inspected_bytes(text: String) -> List(Int) {
+//   let trimmed = string.trim(text)
+// 
+//   let dropped_start = case string.starts_with(trimmed, "<<") {
+//     True -> string.drop_start(from: trimmed, up_to: 2)
+//     False -> trimmed
+//   }
+// 
+//   let dropped_end = case string.ends_with(dropped_start, ">>") {
+//     True -> string.drop_end(from: dropped_start, up_to: 2)
+//     False -> dropped_start
+//   }
+// 
+//   string.split(dropped_end, on: ",")
+//   |> list.map(string.trim)
+//   |> list.filter_map(int.parse)
+// }
 
 /// Return the number of **bits** occupied by the MsgPack value that starts
 /// at `tag`.  For composite types (array, map, ext) this returns header
@@ -191,36 +179,39 @@ fn value_bit_len(tag: Int, _bits: BitArray) -> Int {
 
 // Encode Section //
 
-fn pack_nil() -> MsgPack {
+pub fn pack_nil() -> MsgPack {
   MsgNil
 }
 
-fn pack_bool(value: Bool) -> MsgPack {
+pub fn pack_bool(value: Bool) -> MsgPack {
   MsgBool(value)
 }
 
-fn pack_int(i: Int) -> MsgPack {
+pub fn pack_int(i: Int) -> MsgPack {
   MsgInt(i)
 }
 
-fn pack_string(s: String) -> MsgPack {
+pub fn pack_string(s: String) -> MsgPack {
   MsgString(s)
 }
 
-fn pack_float(f: Float) -> MsgPack {
+pub fn pack_float(f: Float) -> MsgPack {
   MsgFloat(f)
 }
 
-fn pack_binary(data: BitArray) -> MsgPack {
+pub fn pack_binary(data: BitArray) -> MsgPack {
   MsgBinary(data)
 }
 
-fn array(from elements: List(a), of inner_type: fn(a) -> MsgPack) -> MsgPack {
+pub fn pack_array(
+  from elements: List(a),
+  of inner_type: fn(a) -> MsgPack,
+) -> MsgPack {
   let encoded_elements = elements |> list.map(inner_type)
   MsgArray(encoded_elements)
 }
 
-fn map(
+pub fn pack_map(
   from pairs: List(#(k, v)),
   of key_type: fn(k) -> MsgPack,
   and value_type: fn(v) -> MsgPack,
@@ -235,10 +226,24 @@ fn map(
   MsgMap(encoded_pairs)
 }
 
-fn to_bit_array(mp: MsgPack) -> Result(BitArray, EncodeError) {
-  encode(mp)
-}
-
+/// Serialise a `MsgPack` value into its binary `BitArray` representation.
+///
+/// The function pattern-matches every MsgPack constructor and delegates
+/// to the appropriate helper, guaranteeing that *all* valid MsgPack terms
+/// can be encoded without crashing.  
+/// Large or nested structures—`MsgArray` and `MsgMap`—are first converted
+/// to lists or pairs with `encode_list/1` and `encode_pairs/1`, then wrapped
+/// with size-prefixed headers by `encode_array_bits/1` and `encode_map_bits/1`.
+///
+/// ```gleam
+/// import convert_msgpack.{encode, MsgInt}
+///
+/// encode(MsgInt(42))
+/// // => Ok(<<0x2A>>)
+/// ```
+///
+/// Returns `Ok(BitArray)` on success or `Error(EncodeError)` if the value
+/// cannot be represented (for example, an out-of-range integer).
 pub fn encode(mp: MsgPack) -> Result(BitArray, EncodeError) {
   case mp {
     MsgNil -> Ok(<<0xC0:8>>)
@@ -532,32 +537,32 @@ fn decode_str32(bits: BitArray) -> Result(MsgPack, DecodeError) {
   }
 }
 
-fn decode_strn_with_len(
-  bits: BitArray,
-  len_bytes: Int,
-) -> Result(#(MsgPack, Int), DecodeError) {
-  let len_bits = len_bytes * 8
-  let tag_bits = 8
-
-  case bits {
-    <<_tag:unsigned-size(tag_bits), len:unsigned-size(len_bits), rest:bits>> -> {
-      let payload_bits = len * 8
-      let total_bits = tag_bits + len_bits + payload_bits
-
-      case rest {
-        <<payload:bits-size(payload_bits), _rest:bits>> ->
-          case decode_utf8_string(payload, 0, len) {
-            Ok(s) -> Ok(#(MsgString(s), total_bits))
-            Error(e) -> Error(e)
-          }
-
-        _ -> Error(UnableToDecode("Unable to slice string payload"))
-      }
-    }
-
-    _ -> Error(UnableToDecode("Unable to parse string length header"))
-  }
-}
+// fn decode_strn_with_len(
+//   bits: BitArray,
+//   len_bytes: Int,
+// ) -> Result(#(MsgPack, Int), DecodeError) {
+//   let len_bits = len_bytes * 8
+//   let tag_bits = 8
+// 
+//   case bits {
+//     <<_tag:unsigned-size(tag_bits), len:unsigned-size(len_bits), rest:bits>> -> {
+//       let payload_bits = len * 8
+//       let total_bits = tag_bits + len_bits + payload_bits
+// 
+//       case rest {
+//         <<payload:bits-size(payload_bits), _rest:bits>> ->
+//           case decode_utf8_string(payload, 0, len) {
+//             Ok(s) -> Ok(#(MsgString(s), total_bits))
+//             Error(e) -> Error(e)
+//           }
+// 
+//         _ -> Error(UnableToDecode("Unable to slice string payload"))
+//       }
+//     }
+// 
+//     _ -> Error(UnableToDecode("Unable to parse string length header"))
+//   }
+// }
 
 fn decode_bin8(bits: BitArray) -> Result(MsgPack, DecodeError) {
   case bits {
@@ -602,41 +607,41 @@ fn decode_bin32(bits: BitArray) -> Result(MsgPack, DecodeError) {
   }
 }
 
-fn decode_bin_with_len(
-  bits: BitArray,
-  size_bits: Int,
-) -> Result(#(MsgPack, Int), DecodeError) {
-  case bits {
-    <<
-      _tag:unsigned-size(8),
-      len:unsigned-size(8),
-      content:bytes-size(len),
-      _rest:bits,
-    >>
-      if size_bits == 8
-    -> Ok(#(MsgBinary(content), 8 + 8 + len * 8))
-
-    <<
-      _tag:unsigned-size(8),
-      len:unsigned-size(16),
-      content:bytes-size(len),
-      _rest:bits,
-    >>
-      if size_bits == 16
-    -> Ok(#(MsgBinary(content), 8 + 16 + len * 8))
-
-    <<
-      _tag:unsigned-size(8),
-      len:unsigned-size(32),
-      content:bytes-size(len),
-      _rest:bits,
-    >>
-      if size_bits == 32
-    -> Ok(#(MsgBinary(content), 8 + 32 + len * 8))
-
-    _ -> Error(UnableToDecode("Unable to decode binary with given length tag"))
-  }
-}
+// fn decode_bin_with_len(
+//   bits: BitArray,
+//   size_bits: Int,
+// ) -> Result(#(MsgPack, Int), DecodeError) {
+//   case bits {
+//     <<
+//       _tag:unsigned-size(8),
+//       len:unsigned-size(8),
+//       content:bytes-size(len),
+//       _rest:bits,
+//     >>
+//       if size_bits == 8
+//     -> Ok(#(MsgBinary(content), 8 + 8 + len * 8))
+// 
+//     <<
+//       _tag:unsigned-size(8),
+//       len:unsigned-size(16),
+//       content:bytes-size(len),
+//       _rest:bits,
+//     >>
+//       if size_bits == 16
+//     -> Ok(#(MsgBinary(content), 8 + 16 + len * 8))
+// 
+//     <<
+//       _tag:unsigned-size(8),
+//       len:unsigned-size(32),
+//       content:bytes-size(len),
+//       _rest:bits,
+//     >>
+//       if size_bits == 32
+//     -> Ok(#(MsgBinary(content), 8 + 32 + len * 8))
+// 
+//     _ -> Error(UnableToDecode("Unable to decode binary with given length tag"))
+//   }
+// }
 
 fn decode_fixarray(bits: BitArray) -> Result(MsgPack, DecodeError) {
   case bits {
@@ -786,8 +791,29 @@ fn decode_value(tag: Int, bytes: BitArray) -> Result(MsgPack, DecodeError) {
   }
 }
 
-/// Decode one MsgPack value that begins `offset` bits into `bits`.
-/// Returns the value and the bit-offset immediately *after* it.
+/// Decode a single MsgPack value that starts `offset` bits into the given
+/// `bits`, returning both the value and the offset *immediately after* the
+/// parsed term.
+///
+/// Unlike [`parse/2`](#parse), this routine skips the `dynamic` layer and
+/// produces a raw `MsgPack` tree that callers can transform straight into
+/// domain types or inspect for metadata.  It is therefore ideal for streaming
+/// decoders that need fine-grained control over where the next item begins.
+///
+/// ### Parameters
+/// * `bits` – A `BitArray` that may contain one or more concatenated MsgPack
+///   values.
+/// * `offset` – The bit-offset at which the next value is expected to start.
+///
+/// ### Returns
+/// * `Ok(#(msgpack, next_offset))` when decoding succeeds, where
+///   `next_offset` is the first *unconsumed* bit after the value.
+/// * `Error(DecodeError)` when the data end is reached prematurely or an
+///   unknown tag is encountered.
+///
+/// The implementation peeks at the 8-bit tag found at `offset`, then delegates
+/// to `decode_value_with_offset/3` for type-specific logic; errors are wrapped
+/// in `UnableToDecode` to keep failure reporting consistent across the module.
 pub fn decode_msgpack_from_bit_offset(
   bits: BitArray,
   offset: Int,
@@ -877,90 +903,90 @@ fn decode_map_loop(
   }
 }
 
-fn decode_and_add_bits(
-  result: Result(MsgPack, DecodeError),
-  bits_used: Int,
-) -> Result(#(MsgPack, Int), DecodeError) {
-  case result {
-    Ok(val) -> Ok(#(val, bits_used))
-    Error(e) -> Error(e)
-  }
-}
+// fn decode_and_add_bits(
+//   result: Result(MsgPack, DecodeError),
+//   bits_used: Int,
+// ) -> Result(#(MsgPack, Int), DecodeError) {
+//   case result {
+//     Ok(val) -> Ok(#(val, bits_used))
+//     Error(e) -> Error(e)
+//   }
+// }
 
-fn decode_value_with_consumed_bits(
-  tag: Int,
-  bits: BitArray,
-) -> Result(#(MsgPack, Int), DecodeError) {
-  case tag {
-    // NIL
-    0xC0 -> Ok(#(MsgNil, 8))
-
-    // BOOL
-    0xC2 -> Ok(#(MsgBool(False), 8))
-    0xC3 -> Ok(#(MsgBool(True), 8))
-
-    // POSITIVE FIXINT
-    t if t >= 0x00 && t <= 0x7F -> Ok(#(MsgInt(t), 8))
-
-    // NEGATIVE FIXINT
-    t if t >= 0xE0 && t <= 0xFF -> Ok(#(MsgInt(int.subtract(t, 256)), 8))
-
-    // UINT
-    0xCC -> decode_and_add_bits(decode_uint8(bits), 16)
-    0xCD -> decode_and_add_bits(decode_uint16(bits), 24)
-    0xCE -> decode_and_add_bits(decode_uint32(bits), 40)
-    0xCF -> decode_and_add_bits(decode_uint64(bits), 72)
-
-    // INT
-    0xD0 -> decode_and_add_bits(decode_int8(bits), 16)
-    0xD1 -> decode_and_add_bits(decode_int16(bits), 24)
-    0xD2 -> decode_and_add_bits(decode_int32(bits), 40)
-    0xD3 -> decode_and_add_bits(decode_int64(bits), 72)
-
-    // FLOAT
-    0xCA -> decode_and_add_bits(decode_f32(bits), 40)
-    0xCB -> decode_and_add_bits(decode_f64(bits), 72)
-
-    // STRINGS
-    t if t >= 0xA0 && t <= 0xBF -> {
-      let len = t - 0xA0
-      decode_fixstr(bits)
-      |> result.map(fn(val) { #(val, 8 + len * 8) })
-    }
-    0xD9 -> decode_strn_with_len(bits, 8)
-    0xDA -> decode_strn_with_len(bits, 16)
-    0xDB -> decode_strn_with_len(bits, 32)
-
-    // BINARY
-    0xC4 -> decode_bin_with_len(bits, 8)
-    0xC5 -> decode_bin_with_len(bits, 16)
-    0xC6 -> decode_bin_with_len(bits, 32)
-
-    //    // ARRAYS
-    //    t if t >= 0x90 && t <= 0x9F -> decode_array_fixed(bits, t - 0x90, 8)
-    //    0xDC -> decode_array_sized(bits, 16)
-    //    0xDD -> decode_array_sized(bits, 32)
-    //
-    //    // MAPS
-    //    t if t >= 0x80 && t <= 0x8F -> decode_map_fixed(bits, t - 0x80, 8)
-    //    0xDE -> decode_map_sized(bits, 16)
-    //    0xDF -> decode_map_sized(bits, 32)
-    //
-    //    // EXT (unsupported for now)
-    //    0xD4 -> Error("fixext1 decoding not implemented")
-    //    0xD5 -> Error("fixext2 decoding not implemented")
-    //    0xD6 -> Error("fixext4 decoding not implemented")
-    //    0xD7 -> Error("fixext8 decoding not implemented")
-    //    0xD8 -> Error("fixext16 decoding not implemented")
-    //    0xC7 -> Error("ext8 decoding not implemented")
-    //    0xC8 -> Error("ext16 decoding not implemented")
-    //    0xC9 -> Error("ext32 decoding not implemented")
-    _ ->
-      Error(UnableToDecode(
-        "Unsupported or unknown MsgPack tag: " <> int.to_string(tag),
-      ))
-  }
-}
+// fn decode_value_with_consumed_bits(
+//   tag: Int,
+//   bits: BitArray,
+// ) -> Result(#(MsgPack, Int), DecodeError) {
+//   case tag {
+//     // NIL
+//     0xC0 -> Ok(#(MsgNil, 8))
+// 
+//     // BOOL
+//     0xC2 -> Ok(#(MsgBool(False), 8))
+//     0xC3 -> Ok(#(MsgBool(True), 8))
+// 
+//     // POSITIVE FIXINT
+//     t if t >= 0x00 && t <= 0x7F -> Ok(#(MsgInt(t), 8))
+// 
+//     // NEGATIVE FIXINT
+//     t if t >= 0xE0 && t <= 0xFF -> Ok(#(MsgInt(int.subtract(t, 256)), 8))
+// 
+//     // UINT
+//     0xCC -> decode_and_add_bits(decode_uint8(bits), 16)
+//     0xCD -> decode_and_add_bits(decode_uint16(bits), 24)
+//     0xCE -> decode_and_add_bits(decode_uint32(bits), 40)
+//     0xCF -> decode_and_add_bits(decode_uint64(bits), 72)
+// 
+//     // INT
+//     0xD0 -> decode_and_add_bits(decode_int8(bits), 16)
+//     0xD1 -> decode_and_add_bits(decode_int16(bits), 24)
+//     0xD2 -> decode_and_add_bits(decode_int32(bits), 40)
+//     0xD3 -> decode_and_add_bits(decode_int64(bits), 72)
+// 
+//     // FLOAT
+//     0xCA -> decode_and_add_bits(decode_f32(bits), 40)
+//     0xCB -> decode_and_add_bits(decode_f64(bits), 72)
+// 
+//     // STRINGS
+//     t if t >= 0xA0 && t <= 0xBF -> {
+//       let len = t - 0xA0
+//       decode_fixstr(bits)
+//       |> result.map(fn(val) { #(val, 8 + len * 8) })
+//     }
+//     0xD9 -> decode_strn_with_len(bits, 8)
+//     0xDA -> decode_strn_with_len(bits, 16)
+//     0xDB -> decode_strn_with_len(bits, 32)
+// 
+//     // BINARY
+//     0xC4 -> decode_bin_with_len(bits, 8)
+//     0xC5 -> decode_bin_with_len(bits, 16)
+//     0xC6 -> decode_bin_with_len(bits, 32)
+// 
+//     //    // ARRAYS
+//     //    t if t >= 0x90 && t <= 0x9F -> decode_array_fixed(bits, t - 0x90, 8)
+//     //    0xDC -> decode_array_sized(bits, 16)
+//     //    0xDD -> decode_array_sized(bits, 32)
+//     //
+//     //    // MAPS
+//     //    t if t >= 0x80 && t <= 0x8F -> decode_map_fixed(bits, t - 0x80, 8)
+//     //    0xDE -> decode_map_sized(bits, 16)
+//     //    0xDF -> decode_map_sized(bits, 32)
+//     //
+//     //    // EXT (unsupported for now)
+//     //    0xD4 -> Error("fixext1 decoding not implemented")
+//     //    0xD5 -> Error("fixext2 decoding not implemented")
+//     //    0xD6 -> Error("fixext4 decoding not implemented")
+//     //    0xD7 -> Error("fixext8 decoding not implemented")
+//     //    0xD8 -> Error("fixext16 decoding not implemented")
+//     //    0xC7 -> Error("ext8 decoding not implemented")
+//     //    0xC8 -> Error("ext16 decoding not implemented")
+//     //    0xC9 -> Error("ext32 decoding not implemented")
+//     _ ->
+//       Error(UnableToDecode(
+//         "Unsupported or unknown MsgPack tag: " <> int.to_string(tag),
+//       ))
+//   }
+// }
 
 fn drop_offset(result: #(MsgPack, Int)) -> MsgPack {
   let #(mp, _) = result
@@ -1044,6 +1070,41 @@ fn convert_decode_errors(errors: List(decode.DecodeError)) -> DecodeError {
   }
 }
 
+/// Decode a MsgPack‐encoded `BitArray` into a concrete value.
+///
+/// This is the primary entry-point for *decoding* in
+/// `convert_msgpack`. It performs two steps:
+///
+/// 1.  [`parse_bits/1`](#parse_bits) turns the raw `BitArray` into a
+///     [`dynamic.Dynamic`](https://hexdocs.pm/gleam_dynamic/dynamic.html)
+///     value.
+/// 2.  [`decode.run/2`](https://hexdocs.pm/gleam_dynamic/decode.html#run)
+///     applies the user-supplied `decoder`, translating any low-level
+///     failures into this library’s own [`DecodeError`](#DecodeError)
+///     with `convert_decode_errors/1`.
+///
+/// ```gleam
+/// import codec/gmsg
+/// import convert_msgpack
+///
+/// let bytes = <<0x92, 1, 2>>  // MsgPack array [1, 2]
+///
+/// case convert_msgpack.parse(bytes, gmsg.array(gmsg.int)) {
+///   Ok([1, 2]) -> do_something()
+///   Error(err) -> handle(err)
+/// }
+/// ```
+///
+/// ### Parameters
+///
+/// - `bits` – A complete MsgPack document as a `BitArray`.
+/// - `decoder` – A `decode.Decoder(t)` describing how to map the
+///   intermediate dynamic value into the target type `t`.
+///
+/// Returns `Ok(t)` on success, or `Error(DecodeError)` when decoding fails.
+///
+/// > **Note**: `parse/2` is *total*; it never crashes. All problems are
+/// > surfaced as a value you can pattern-match on.
 pub fn parse(
   from bits: BitArray,
   using decoder: decode.Decoder(t),
